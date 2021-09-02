@@ -54,7 +54,6 @@ def read_train_test():
 # Function to preprocess book data (for each stock id)
 def book_preprocessor(file_path):
     df = pd.read_parquet(file_path)
-    print("book_preprocessor", df.head())
     # Calculate Wap
     df['wap1'] = calc_wap1(df)
     df['wap2'] = calc_wap2(df)
@@ -63,7 +62,8 @@ def book_preprocessor(file_path):
     df['log_return2'] = df.groupby(['time_id'])['wap2'].apply(log_return)
 
     # Calculate squared difference in time
-    df['time_diff'] = df.groupby(['time_id'])['seconds_in_bucket'].diff().pow(0.5)
+    df['time_diff'] = df.groupby(['time_id'])['seconds_in_bucket'].diff()
+    df.time_diff = df.time_diff.fillna(1)
     df['updates'] = df.groupby(['time_id'])['seconds_in_bucket'].transform('count')
 
     # Calculate wap balance
@@ -76,6 +76,7 @@ def book_preprocessor(file_path):
     df["bid_ask_spread"] = abs(df['bid_spread'] - df['ask_spread'])
     df['total_volume'] = (df['ask_size1'] + df['ask_size2']) + (df['bid_size1'] + df['bid_size2'])
     df['volume_imbalance'] = abs((df['ask_size1'] + df['ask_size2']) - (df['bid_size1'] + df['bid_size2']))
+    df['instant_volatility'] = df['log_return1'] / (df['time_diff'].pow(0.5))
 
     # Dict for aggregations
     create_feature_dict = {
@@ -86,11 +87,12 @@ def book_preprocessor(file_path):
         'wap_balance': [np.sum, np.mean, np.std],
         'price_spread':[np.sum, np.mean, np.std],
         'price_spread2':[np.sum, np.mean, np.std],
-        'bid_spread':[np.sum, np.mean, np.std],
-        'ask_spread':[np.sum, np.mean, np.std],
-        'total_volume':[np.sum, np.mean, np.std],
-        'volume_imbalance':[np.sum, np.mean, np.std],
-        'bid_ask_spread':[np.sum, np.mean, np.std],        
+        'bid_spread': [np.sum, np.mean, np.std],
+        'ask_spread': [np.sum, np.mean, np.std],
+        'total_volume': [np.sum, np.mean, np.std],
+        'volume_imbalance': [np.sum, np.mean, np.std],
+        'bid_ask_spread': [np.sum, np.mean, np.std],
+        'instant_volatility': [realized_volatility],
     }
     
     create_time_feature_dict = {
@@ -141,7 +143,7 @@ def book_preprocessor(file_path):
 def trade_preprocessor(file_path):
     df = pd.read_parquet(file_path)
     df['log_return'] = df.groupby('time_id')['price'].apply(log_return)
-    
+
     # Dict for aggregations
     create_feature_dict = {
         'log_return':[realized_volatility],
@@ -265,7 +267,7 @@ def train_and_evaluate(train, test, seed=29, folds=5, save_model=True):
     # Hyperparammeters (optimized)
     
     params = {
-        'learning_rate': 0.1,        
+        'learning_rate': 0.1,
         'lambda_l1': 2,
         'lambda_l2': 7,
         'num_leaves': 1000,
@@ -319,8 +321,8 @@ def train_and_evaluate(train, test, seed=29, folds=5, save_model=True):
                           verbose_eval = 100,
                           feval = feval_rmspe)
 
-        if save_model:
-            model.booster_.save_model(models_dir + 'lgbm_' + str(fold) + '.txt')
+        #if save_model:
+        #    model.booster_.save_model(models_dir + 'lgbm_' + str(fold) + '.txt')
             # To load the model use:
             # model = lgb.Booster(model_file='mode.txt')
 
