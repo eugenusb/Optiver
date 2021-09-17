@@ -10,16 +10,22 @@ import lightgbm as lgb
 import catboost as ctb
 import seaborn as sns
 import umap
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
 from arch import arch_model
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
+from . import mdn
+from scipy.stats import invgamma
 
 import warnings
 warnings.filterwarnings('ignore')
 
-
 # directory
 data_dir = 'data/'
 models_dir = 'models/'
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # Function to calculate first WAP
 def calc_wap1(df):
@@ -50,19 +56,19 @@ df_sec = pd.DataFrame()
 df_sec['seconds'] = np.arange(0,601)
 
 def garch_est(df):
-    df_aux = pd.merge(df, df_sec, left_on='seconds_in_bucket', right_on='seconds', how='right')
-    df_aux = df_aux.ffill()
-    df_aux = df_aux.fillna(0)
-    df_aux['cum_vol'] = df_aux.log_return1.pow(2).cumsum().pow(0.5)
+	df_aux = pd.merge(df, df_sec, left_on='seconds_in_bucket', right_on='seconds', how='right')
+	df_aux = df_aux.ffill()
+	df_aux = df_aux.fillna(0)
+	df_aux['cum_vol'] = df_aux.log_return1.pow(2).cumsum().pow(0.5)
 
-    garch = arch_model(df_aux.cum_vol, mean='Zero', vol='GARCH', p=10, q=10)
-    garch_fit = garch.fit(show_warning=False, disp='off')
-    sigma_hat = garch_fit.forecast(horizon=10)
-    garch_estimation = np.sqrt(sigma_hat.variance.values[-1][-1])
+	garch = arch_model(df_aux.cum_vol, mean='Zero', vol='GARCH', p=10, q=10)
+	garch_fit = garch.fit(show_warning=False, disp='off')
+	sigma_hat = garch_fit.forecast(horizon=10)
+	garch_estimation = np.sqrt(sigma_hat.variance.values[-1][-1])
 
-    df['garch_estimation'] = garch_estimation
-    #ans = pd.Series(garch_estimation, index=df.index)
-    return df
+	df['garch_estimation'] = garch_estimation
+	#ans = pd.Series(garch_estimation, index=df.index)
+	return df
 
 # Function to read our base train and test set
 def read_train_test():
@@ -136,7 +142,7 @@ def book_preprocessor(file_path):
 		if add_suffix:
 			df_feature = df_feature.add_suffix('_' + str(seconds_in_bucket))
 		return df_feature
-	
+
 	# Get the stats for different windows
 	df_feature = get_stats_window(seconds_in_bucket=0, add_suffix=False)
 	df_feature_updates = get_stats_window(seconds_in_bucket=0, feature_dict=create_time_feature_dict, add_suffix=False)
@@ -160,10 +166,12 @@ def book_preprocessor(file_path):
 	stock_id = file_path.split('=')[1]
 	df_feature['row_id'] = df_feature['time_id_'].apply(lambda x: f'{stock_id}-{x}')
 	df_feature.drop(['time_id_'], axis = 1, inplace = True)
+
 	return df_feature
 
 # Function to preprocess trade data (for each stock id)
 def trade_preprocessor(file_path):
+
 	df = pd.read_parquet(file_path)
 	df['log_return'] = df.groupby('time_id')['price'].apply(log_return)
 
@@ -208,7 +216,7 @@ def trade_preprocessor(file_path):
 
 # Function to get group stats for the stock_id and time_id
 def get_time_stock(df):
-	#print(df.head())
+
 	# Get realized volatility columns
 	vol_cols = ['log_return1_realized_volatility', 'log_return2_realized_volatility', 'log_return1_realized_volatility_450', 'log_return2_realized_volatility_450', 
 				'log_return1_realized_volatility_300', 'log_return2_realized_volatility_300', 'log_return1_realized_volatility_150', 'log_return2_realized_volatility_150', 
@@ -262,6 +270,7 @@ def preprocessor(list_stock_ids, is_train = True):
 	return df
 
 def era_projection(train, test):
+
 	reducer_times = umap.UMAP()
 
 	df_times = train.groupby('time_id').mean()
@@ -381,14 +390,227 @@ def train_and_evaluate(train, test, seed=29, folds=5, save_model=True):
 	# Return test predictions
 	return test_predictions
 
+# Prepare data for Pytorch MDN Model
+
+def data_load(X_train, y_train, X_test, y_test, batch_size=32):
+
+	train_data = TensorDataset(torch.from_numpy(X_train).float().to(device), torch.from_numpy(y_train).float().to(device))
+	test_data = TensorDataset(torch.from_numpy(X_test).float().to(device), torch.from_numpy(y_test).float().to(device))
+
+	train_dataloader = DataLoader(train_data, batch_size=batch_size, shuffle=True)
+	test_dataloader = DataLoader(test_data, batch_size=batch_size, shuffle=True)
+
+	return train_dataloader, test_dataloader
+
+class MDN_model(nn.Module):
+	def __init__(self, n_features, n_gaussians=3):
+		super(MDN_model, self).__init__()
+		
+		self.n_features = n_features
+		self.silu = nn.SiLU()
+
+		self.linear1 = nn.Linear(n_features, 64)
+		self.linear2 = nn.Linear(64, 32)
+		self.linear3 = nn.Linear(32, 16)
+		self.mix_density = nn.MDN(16, 1, n_gaussians)
+
+	def forward(self, x):
+		output = self.linear1(x)
+		output = self.silu(output)
+		output = self.linear2(output)
+		output = self.silu(output)
+		output = self.linear3(output)
+		output = self.silu(output)
+		output = self.mix_density(output)
+
+		return output
+
+class InvGamma_model(nn.Module):
+	def __init__(self, n_features):
+		super(InvGamma_model, self).__init__()
+		
+		self.n_features = n_features
+		self.silu = nn.SiLU()
+		self.linear1 = nn.Linear(n_features, 64)
+		self.linear2 = nn.Linear(64, 32)
+		self.linear3 = nn.Linear(32, 16)
+		self.density = mdn.InvGamma(16)
+
+	def forward(self, x):
+		output = self.linear1(x)
+		output = self.silu(output)
+		output = self.linear2(output)
+		output = self.silu(output)
+		output = self.linear3(output)
+		output = self.silu(output)
+		output = self.density(output)
+
+		return output
 
 
+def get_predictions(alpha, sigma):
+	n = alpha.shape[0]
+	preds = np.zeros(n)
+
+	for i in range(n):
+		sample_gamma = invgamma.rvs(alpha[i], loc=0, scale=sigma[i], size=1000)
+		inv_expected_value = ( 1 / sample_gamma ).mean()
+		inv_variance = ( 1 / (sample_gamma**2) ).mean()
+
+		preds[i] = inv_expected_value / inv_variance
+
+	return preds
 
 
+def train_and_evaluate_InvGamma(train, test, seed=29, folds=5, epochs=40, save_model=True):
+
+	# Split features and target
+	correlations = train.corrwith(train.target).abs()
+	predictors = list(correlations[correlations > 0.5].index.drop('target')) + ['stock_id', 'time_id']
+
+	x = train[predictors]
+	y = train['target']
+	x_test = test[predictors]
+	# Transform stock id to a numeric value
+	x['stock_id'] = x['stock_id'].astype(int)
+	x_test['stock_id'] = x_test['stock_id'].astype(int)
+
+	# Create out of folds array
+	oof_predictions = np.zeros(x.shape[0])
+	# Create test array to store predictions
+	test_predictions = np.zeros(x_test.shape[0])
+	# Create a KFold object
+	kfold = KFold(n_splits=folds, random_state=1111, shuffle=True)
+	# Iterate through each fold	
+
+	for fold, (trn_ind, val_ind) in enumerate(kfold.split(x)):
+		print(f'Training fold {fold + 1}')
+		x_train, x_val = x.iloc[trn_ind], x.iloc[val_ind]
+		y_train, y_val = y.iloc[trn_ind].values, y.iloc[val_ind].values
+
+		scaler = MinMaxScaler(feature_range=(0,1))
+		x_train = scaler.fit_transform(x_train)
+		x_val = scaler.transform(x_val)
+		model = InvGamma_model(x_train.shape[1])
+
+		train_dataloader, val_dataloader = data_load(x_train, y_train, x_val, y_val)
+		model.cuda()
+		optimizer = optim.Adam(model.parameters())
+
+		# train the model
+		model.train()
+		for epoch in range(epochs):
+			train_loss = 0
+			counter = 0
+			for inputs, labels in train_dataloader:
+				inputs, labels = inputs.to(device), labels.to(device)
+				model.zero_grad()
+				alpha, sigma = model(inputs)
+				loss = mdn.inv_gamma_loss(alpha, sigma, labels)
+				train_loss += loss.item()
+				loss.backward()
+				optimizer.step()
+				counter += 1
+
+			print('TRAIN | Epoch: {}/{} | Loss: {:.8f}'.format(epoch+1, epochs, train_loss / counter))
+
+		model.eval()
+		val_tensor = torch.tensor(x_val, dtype=torch.float).to(device)
+		alpha, sigma = model(val_tensor)
+		alpha, sigma = alpha.detach().cpu().numpy(), sigma.detach().cpu().numpy()
+		# Add predictions to the out of folds array
+		oof_predictions[val_ind] = get_predictions(alpha, sigma)
+		# Predict the test set
+		#test_predictions += model.predict(x_test) / 20
+
+		#if save_model:
+		#    model.booster_.save_model(models_dir + 'lgbm_' + str(fold) + '.txt')
+			# To load the model use:
+			# model = lgb.Booster(model_file='mode.txt')
+
+
+	rmspe_score = rmspe(y, oof_predictions)
+	print(f'Our out of folds RMSPE is {rmspe_score}')
+	# Return test predictions
+	return test_predictions
+
+
+def train_and_evaluate_MDN(train, test, seed=29, folds=5, epochs=40, save_model=True):
+
+	# Split features and target
+	correlations = train.corrwith(train.target).abs()
+	predictors = list(correlations[correlations > 0.5].index.drop('target')) + ['stock_id', 'time_id']
+
+	x = train[predictors]
+	y = train['target']
+	x_test = test[predictors]
+	# Transform stock id to a numeric value
+	x['stock_id'] = x['stock_id'].astype(int)
+	x_test['stock_id'] = x_test['stock_id'].astype(int)
+
+	# Create out of folds array
+	oof_predictions = np.zeros(x.shape[0])
+	# Create test array to store predictions
+	test_predictions = np.zeros(x_test.shape[0])
+	# Create a KFold object
+	kfold = KFold(n_splits=folds, random_state=seed, shuffle=True)
+	# Iterate through each fold
+
+	device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+	for fold, (trn_ind, val_ind) in enumerate(kfold.split(x)):
+		print(f'Training fold {fold + 1}')
+		x_train, x_val = x.iloc[trn_ind], x.iloc[val_ind]
+		y_train, y_val = y.iloc[trn_ind].values, y.iloc[val_ind].values
+
+		scaler = MinMaxScaler(feature_range=(0,1))
+		x_train = scaler.fit_transform(x_train)
+		x_val = scaler.transform(x_val)
+		model = MDN_model(x_train.shape[1])
+
+		train_dataloader, val_dataloader = data_load(x_train, y_train, x_val, y_val)
+		model.cuda()
+		optimizer = optim.Adam(model.parameters())
+
+		# train the model
+		model.train()
+		for epoch in range(epochs):
+			train_loss = 0
+			counter = 0
+			for inputs, labels in train_dataloader:
+				model.zero_grad()
+				pi, sigma, mu = model(inputs)
+				loss = mdn.mdn_loss(pi, sigma, mu, labels)
+				train_loss += loss.item()
+				loss.backward()
+				optimizer.step()
+				counter += 1
+
+			print('TRAIN | Epoch: {}/{} | Loss: {:.8f}'.format(epoch+1, epochs, train_loss / counter))
+
+		model.eval()
+		val_tensor = torch.tensor(x_val, dtype=torch.float).to(device)
+		pi, sigma, mu = model(val_tensor)
+		pi, sigma, mu = torch.exp(pi).detach().cpu().numpy(), torch.exp(sigma).detach().cpu().numpy(), torch.exp(mu).detach().cpu().numpy()
+		# Add predictions to the out of folds array
+		oof_predictions[val_ind] = get_predictions(pi, sigma, mu)
+		# Predict the test set
+		#test_predictions += model.predict(x_test) / 20
+
+		#if save_model:
+		#    model.booster_.save_model(models_dir + 'lgbm_' + str(fold) + '.txt')
+			# To load the model use:
+			# model = lgb.Booster(model_file='mode.txt')
+
+
+	rmspe_score = rmspe(y, oof_predictions)
+	print(f'Our out of folds RMSPE is {rmspe_score}')
+	# Return test predictions
+	return test_predictions
 
 
 def train_and_evaluate_ctb(train, test):
-	# Hyperparammeters (optimized)
+
 	seed = 29    
 	# Split features and target
 	x = train.drop(['row_id', 'target', 'time_id'], axis = 1)
