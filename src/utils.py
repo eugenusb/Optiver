@@ -5,19 +5,8 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import scipy as sc
-from sklearn.model_selection import KFold
-import lightgbm as lgb
-import catboost as ctb
-import seaborn as sns
-import umap
-from sklearn.preprocessing import MinMaxScaler, StandardScaler
 from arch import arch_model
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import TensorDataset, DataLoader
-from . import mdn
-from scipy.stats import invgamma
+
 
 import warnings
 warnings.filterwarnings('ignore')
@@ -25,7 +14,6 @@ warnings.filterwarnings('ignore')
 # directory
 data_dir = 'data/'
 models_dir = 'models/'
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # Function to calculate first WAP
 def calc_wap1(df):
@@ -35,6 +23,14 @@ def calc_wap1(df):
 # Function to calculate second WAP
 def calc_wap2(df):
 	wap = (df['bid_price2'] * df['ask_size2'] + df['ask_price2'] * df['bid_size2']) / (df['bid_size2'] + df['ask_size2'])
+	return wap
+
+def calc_wap3(df):
+	wap = (df['bid_price1'] * df['bid_size1'] + df['ask_price1'] * df['ask_size1']) / (df['bid_size1'] + df['ask_size1'])
+	return wap
+
+def calc_wap4(df):
+	wap = (df['bid_price2'] * df['bid_size2'] + df['ask_price2'] * df['ask_size2']) / (df['bid_size2'] + df['ask_size2'])
 	return wap
 
 # Function to calculate the log of the return
@@ -86,17 +82,18 @@ def book_preprocessor(file_path):
 	# Calculate Wap
 	df['wap1'] = calc_wap1(df)
 	df['wap2'] = calc_wap2(df)
-	# Calculate log returns
-	df['log_return1'] = df.groupby(['time_id'])['wap1'].apply(log_return)
-	df['log_return2'] = df.groupby(['time_id'])['wap2'].apply(log_return)
-
+	df['wap3'] = calc_wap3(df)
+	df['wap4'] = calc_wap4(df)
 	#df = df.groupby(['time_id']).apply(garch_est)
-
 	# Calculate squared difference in time
 	df['time_diff'] = df.groupby(['time_id'])['seconds_in_bucket'].diff()
 	df.time_diff = df.time_diff.fillna(1)
 	df['updates'] = df.groupby(['time_id'])['seconds_in_bucket'].transform('count')
-
+	# Calculate log returns
+	df['log_return1'] = df.groupby(['time_id'])['wap1'].apply(log_return)
+	df['log_return2'] = df.groupby(['time_id'])['wap2'].apply(log_return)
+	df['log_return3'] = df.groupby(['time_id'])['wap3'].apply(log_return)
+	df['log_return4'] = df.groupby(['time_id'])['wap4'].apply(log_return)
 	# Calculate wap balance
 	df['wap_balance'] = abs(df['wap1'] - df['wap2'])
 	# Calculate spread
@@ -108,106 +105,146 @@ def book_preprocessor(file_path):
 	df['total_volume'] = (df['ask_size1'] + df['ask_size2']) + (df['bid_size1'] + df['bid_size2'])
 	df['volume_imbalance'] = abs((df['ask_size1'] + df['ask_size2']) - (df['bid_size1'] + df['bid_size2']))
 	df['instant_volatility'] = df['log_return1'] / (df['time_diff'].pow(0.5))
-
+	
 	# Dict for aggregations
 	create_feature_dict = {
 		'wap1': [np.sum, np.mean, np.std],
 		'wap2': [np.sum, np.mean, np.std],
+		'wap3': [np.sum, np.mean, np.std],
+		'wap4': [np.sum, np.mean, np.std],
 		'log_return1': [np.sum, realized_volatility, np.mean, np.std],
 		'log_return2': [np.sum, realized_volatility, np.mean, np.std],
+		'log_return3': [np.sum, realized_volatility, np.mean, np.std],
+		'log_return4': [np.sum, realized_volatility, np.mean, np.std],
 		'wap_balance': [np.sum, np.mean, np.std],
 		'price_spread':[np.sum, np.mean, np.std],
 		'price_spread2':[np.sum, np.mean, np.std],
-		'bid_spread': [np.sum, np.mean, np.std],
-		'ask_spread': [np.sum, np.mean, np.std],
-		'total_volume': [np.sum, np.mean, np.std],
-		'volume_imbalance': [np.sum, np.mean, np.std],
-		'bid_ask_spread': [np.sum, np.mean, np.std],
-		'instant_volatility': [realized_volatility],		
+		'bid_spread':[np.sum, np.mean, np.std],
+		'ask_spread':[np.sum, np.mean, np.std],
+		'total_volume':[np.sum, np.mean, np.std],
+		'volume_imbalance':[np.sum, np.mean, np.std],
+		"bid_ask_spread":[np.sum, np.mean, np.std],
+		'instant_volatility': [realized_volatility],
+	}
+	create_feature_dict_time = {
+		'log_return1': [realized_volatility],
+		'log_return2': [realized_volatility],
+		'log_return3': [realized_volatility],
+		'log_return4': [realized_volatility],        
 	}
 	
-	create_time_feature_dict = {
-		'time_diff': [np.sum, np.std],
-		'updates': [np.mean],
-	#	'garch_estimation': [np.mean],
-	}
-
 	# Function to get group stats for different windows (seconds in bucket)
-	def get_stats_window(seconds_in_bucket, feature_dict=create_feature_dict, add_suffix = False):
+	def get_stats_window(fe_dict, seconds_in_bucket, add_suffix = False):
 		# Group by the window
-		df_feature = df[df['seconds_in_bucket'] >= seconds_in_bucket].groupby(['time_id']).agg(feature_dict).reset_index()
+		df_feature = df[df['seconds_in_bucket'] >= seconds_in_bucket].groupby(['time_id']).agg(fe_dict).reset_index()
 		# Rename columns joining suffix
 		df_feature.columns = ['_'.join(col) for col in df_feature.columns]
 		# Add a suffix to differentiate windows
 		if add_suffix:
 			df_feature = df_feature.add_suffix('_' + str(seconds_in_bucket))
 		return df_feature
-
+	
 	# Get the stats for different windows
-	df_feature = get_stats_window(seconds_in_bucket=0, add_suffix=False)
-	df_feature_updates = get_stats_window(seconds_in_bucket=0, feature_dict=create_time_feature_dict, add_suffix=False)
-	df_feature_updates['time_diff_sum'] = np.sqrt(df_feature_updates['time_diff_sum'].values)
-	df_feature_450 = get_stats_window(seconds_in_bucket=450, add_suffix=True)
-	df_feature_300 = get_stats_window(seconds_in_bucket=300, add_suffix=True)
-	df_feature_150 = get_stats_window(seconds_in_bucket=150, add_suffix=True)
+	df_feature = get_stats_window(create_feature_dict,seconds_in_bucket = 0, add_suffix = False)	
+	df_feature_450 = get_stats_window(create_feature_dict_time, seconds_in_bucket = 450, add_suffix = True)
+	df_feature_300 = get_stats_window(create_feature_dict_time, seconds_in_bucket = 300, add_suffix = True)	
+	df_feature_150 = get_stats_window(create_feature_dict_time, seconds_in_bucket = 150, add_suffix = True)
 
 	# Merge all
-	df_feature = df_feature.merge(df_feature_updates, how = 'left', left_on = 'time_id_', right_on = 'time_id_')
-	df_feature = df_feature.merge(df_feature_450, how = 'left', left_on = 'time_id_', right_on = 'time_id__450')
-	df_feature = df_feature.merge(df_feature_300, how = 'left', left_on = 'time_id_', right_on = 'time_id__300')
+	df_feature = df_feature.merge(df_feature_450, how = 'left', left_on = 'time_id_', right_on = 'time_id__450')	
+	df_feature = df_feature.merge(df_feature_300, how = 'left', left_on = 'time_id_', right_on = 'time_id__300')	
 	df_feature = df_feature.merge(df_feature_150, how = 'left', left_on = 'time_id_', right_on = 'time_id__150')
 	# Drop unnecesary time_ids
-	df_feature.drop(['time_id__450', 'time_id__300', 'time_id__150'], axis = 1, inplace = True)
-
-	df_sec = pd.DataFrame()
-	df_sec['seconds'] = np.arange(0,601)
+	df_feature.drop(['time_id__450','time_id__300', 'time_id__150'], axis = 1, inplace = True)
 
 	# Create row_id so we can merge
 	stock_id = file_path.split('=')[1]
 	df_feature['row_id'] = df_feature['time_id_'].apply(lambda x: f'{stock_id}-{x}')
 	df_feature.drop(['time_id_'], axis = 1, inplace = True)
-
 	return df_feature
 
 # Function to preprocess trade data (for each stock id)
 def trade_preprocessor(file_path):
-
 	df = pd.read_parquet(file_path)
 	df['log_return'] = df.groupby('time_id')['price'].apply(log_return)
-
+	df['amount']=df['price']*df['size']
 	# Dict for aggregations
 	create_feature_dict = {
 		'log_return':[realized_volatility],
 		'seconds_in_bucket':[count_unique],
-		'size':[np.sum],
-		'order_count':[np.mean],
+		'size':[np.sum, np.max, np.min],
+		'order_count':[np.sum,np.max],
+		'amount':[np.sum,np.max,np.min],
 	}
-
+	create_feature_dict_time = {
+		'log_return':[realized_volatility],
+		'seconds_in_bucket':[count_unique],
+		'size':[np.sum],
+		'order_count':[np.sum],
+	}
 	# Function to get group stats for different windows (seconds in bucket)
-	def get_stats_window(seconds_in_bucket, add_suffix = False):
+	def get_stats_window(fe_dict,seconds_in_bucket, add_suffix = False):
 		# Group by the window
-		df_feature = df[df['seconds_in_bucket'] >= seconds_in_bucket].groupby(['time_id']).agg(create_feature_dict).reset_index()
-
+		df_feature = df[df['seconds_in_bucket'] >= seconds_in_bucket].groupby(['time_id']).agg(fe_dict).reset_index()
 		# Rename columns joining suffix
 		df_feature.columns = ['_'.join(col) for col in df_feature.columns]
 		# Add a suffix to differentiate windows
 		if add_suffix:
 			df_feature = df_feature.add_suffix('_' + str(seconds_in_bucket))
 		return df_feature
+	
 
 	# Get the stats for different windows
-	df_feature = get_stats_window(seconds_in_bucket = 0, add_suffix = False)
-	df_feature_450 = get_stats_window(seconds_in_bucket = 450, add_suffix = True)
-	df_feature_300 = get_stats_window(seconds_in_bucket = 300, add_suffix = True)
-	df_feature_150 = get_stats_window(seconds_in_bucket = 150, add_suffix = True)
-
+	df_feature = get_stats_window(create_feature_dict,seconds_in_bucket = 0, add_suffix = False)
+	df_feature_500 = get_stats_window(create_feature_dict_time, seconds_in_bucket = 500, add_suffix = True)
+	df_feature_400 = get_stats_window(create_feature_dict_time, seconds_in_bucket = 400, add_suffix = True)
+	df_feature_300 = get_stats_window(create_feature_dict_time, seconds_in_bucket = 300, add_suffix = True)
+	df_feature_200 = get_stats_window(create_feature_dict_time, seconds_in_bucket = 200, add_suffix = True)
+	df_feature_100 = get_stats_window(create_feature_dict_time, seconds_in_bucket = 100, add_suffix = True)
+	
+	def tendency(price, vol):    
+		df_diff = np.diff(price)
+		val = (df_diff/price[1:])*100
+		power = np.sum(val*vol[1:])
+		return(power)
+	
+	lis = []
+	for n_time_id in df['time_id'].unique():
+		df_id = df[df['time_id'] == n_time_id]        
+		tendencyV = tendency(df_id['price'].values, df_id['size'].values)      
+		f_max = np.sum(df_id['price'].values > np.mean(df_id['price'].values))
+		f_min = np.sum(df_id['price'].values < np.mean(df_id['price'].values))
+		df_max =  np.sum(np.diff(df_id['price'].values) > 0)
+		df_min =  np.sum(np.diff(df_id['price'].values) < 0)
+		# new
+		abs_diff = np.median(np.abs( df_id['price'].values - np.mean(df_id['price'].values)))        
+		energy = np.mean(df_id['price'].values**2)
+		iqr_p = np.percentile(df_id['price'].values,75) - np.percentile(df_id['price'].values,25)
+		
+		# vol vars
+		
+		abs_diff_v = np.median(np.abs( df_id['size'].values - np.mean(df_id['size'].values)))        
+		energy_v = np.sum(df_id['size'].values**2)
+		iqr_p_v = np.percentile(df_id['size'].values,75) - np.percentile(df_id['size'].values,25)
+		
+		lis.append({'time_id':n_time_id,'tendency':tendencyV,'f_max':f_max,'f_min':f_min,'df_max':df_max,'df_min':df_min,
+				   'abs_diff':abs_diff,'energy':energy,'iqr_p':iqr_p,'abs_diff_v':abs_diff_v,'energy_v':energy_v,'iqr_p_v':iqr_p_v})
+	
+	df_lr = pd.DataFrame(lis)
+		
+   
+	df_feature = df_feature.merge(df_lr, how = 'left', left_on = 'time_id_', right_on = 'time_id')
+	
 	# Merge all
-	df_feature = df_feature.merge(df_feature_450, how = 'left', left_on = 'time_id_', right_on = 'time_id__450')
+	df_feature = df_feature.merge(df_feature_500, how = 'left', left_on = 'time_id_', right_on = 'time_id__500')
+	df_feature = df_feature.merge(df_feature_400, how = 'left', left_on = 'time_id_', right_on = 'time_id__400')
 	df_feature = df_feature.merge(df_feature_300, how = 'left', left_on = 'time_id_', right_on = 'time_id__300')
-	df_feature = df_feature.merge(df_feature_150, how = 'left', left_on = 'time_id_', right_on = 'time_id__150')
+	df_feature = df_feature.merge(df_feature_200, how = 'left', left_on = 'time_id_', right_on = 'time_id__200')
+	df_feature = df_feature.merge(df_feature_100, how = 'left', left_on = 'time_id_', right_on = 'time_id__100')
 	# Drop unnecesary time_ids
-	df_feature.drop(['time_id__450', 'time_id__300', 'time_id__150'], axis = 1, inplace = True)
-
+	df_feature.drop(['time_id__500','time_id__400', 'time_id__300', 'time_id__200','time_id','time_id__100'], axis = 1, inplace = True)
+	
+	
 	df_feature = df_feature.add_prefix('trade_')
 	stock_id = file_path.split('=')[1]
 	df_feature['row_id'] = df_feature['trade_time_id_'].apply(lambda x:f'{stock_id}-{x}')
@@ -216,11 +253,9 @@ def trade_preprocessor(file_path):
 
 # Function to get group stats for the stock_id and time_id
 def get_time_stock(df):
-
-	# Get realized volatility columns
-	vol_cols = ['log_return1_realized_volatility', 'log_return2_realized_volatility', 'log_return1_realized_volatility_450', 'log_return2_realized_volatility_450', 
+	vol_cols = ['log_return1_realized_volatility', 'log_return2_realized_volatility', 'log_return1_realized_volatility_450', 'log_return2_realized_volatility_450',
 				'log_return1_realized_volatility_300', 'log_return2_realized_volatility_300', 'log_return1_realized_volatility_150', 'log_return2_realized_volatility_150', 
-				'trade_log_return_realized_volatility', 'trade_log_return_realized_volatility_450', 'trade_log_return_realized_volatility_300', 'trade_log_return_realized_volatility_150']
+				'trade_log_return_realized_volatility', 'trade_log_return_realized_volatility_400', 'trade_log_return_realized_volatility_300', 'trade_log_return_realized_volatility_200']
 
 	# Group by the stock id
 	df_stock_id = df.groupby(['stock_id'])[vol_cols].agg(['mean', 'std', 'max', 'min', ]).reset_index()
@@ -228,10 +263,7 @@ def get_time_stock(df):
 	df_stock_id.columns = ['_'.join(col) for col in df_stock_id.columns]
 	df_stock_id = df_stock_id.add_suffix('_' + 'stock')
 
-	#df_time_by_stock = df.groupby(['stock_id'])['squared_time_diff'].sum().reset_index()
-	#df_stock_id = df_stock_id.merge(df_time_by_stock)
-	
-	# Group by the time id
+	# Group by the stock id
 	df_time_id = df.groupby(['time_id'])[vol_cols].agg(['mean', 'std', 'max', 'min', ]).reset_index()
 	# Rename columns joining suffix
 	df_time_id.columns = ['_'.join(col) for col in df_time_id.columns]
@@ -244,7 +276,7 @@ def get_time_stock(df):
 	return df
 
 # Function to make preprocessing function in parallel (for each stock id)
-def preprocessor(list_stock_ids, is_train = True):
+def preprocessor(list_stock_ids, is_train=True):
 	
 	# Parallel for loop
 	def for_joblib(stock_id):
@@ -264,10 +296,36 @@ def preprocessor(list_stock_ids, is_train = True):
 		return df_tmp
 
 	# Use parallel api to call paralle for loop
-	df = Parallel(n_jobs = -1, verbose = 1)(delayed(for_joblib)(stock_id) for stock_id in list_stock_ids)
+	df = Parallel(n_jobs=15, verbose=1)(delayed(for_joblib)(stock_id) for stock_id in list_stock_ids)	
 	# Concatenate all the dataframes that return from Parallel
-	df = pd.concat(df, ignore_index = True)
+	df = pd.concat(df, ignore_index=True)
 	return df
+
+def tau_features(train, test):
+	# replace by order sum (tau)
+	train['size_tau'] = np.sqrt( 1/ train['trade_seconds_in_bucket_count_unique'] )
+	test['size_tau'] = np.sqrt( 1/ test['trade_seconds_in_bucket_count_unique'] )
+	train['size_tau_400'] = np.sqrt( 1/ train['trade_seconds_in_bucket_count_unique_400'] )
+	test['size_tau_400'] = np.sqrt( 1/ test['trade_seconds_in_bucket_count_unique_400'] )
+	train['size_tau_300'] = np.sqrt( 1/ train['trade_seconds_in_bucket_count_unique_300'] )
+	test['size_tau_300'] = np.sqrt( 1/ test['trade_seconds_in_bucket_count_unique_300'] )
+	train['size_tau_200'] = np.sqrt( 1/ train['trade_seconds_in_bucket_count_unique_200'] )
+	test['size_tau_200'] = np.sqrt( 1/ test['trade_seconds_in_bucket_count_unique_200'] )
+
+	train['size_tau2'] = np.sqrt( 1/ train['trade_order_count_sum'] )
+	test['size_tau2'] = np.sqrt( 1/ test['trade_order_count_sum'] )
+	train['size_tau2_400'] = np.sqrt( 0.33/ train['trade_order_count_sum'] )
+	test['size_tau2_400'] = np.sqrt( 0.33/ test['trade_order_count_sum'] )
+	train['size_tau2_300'] = np.sqrt( 0.5/ train['trade_order_count_sum'] )
+	test['size_tau2_300'] = np.sqrt( 0.5/ test['trade_order_count_sum'] )
+	train['size_tau2_200'] = np.sqrt( 0.66/ train['trade_order_count_sum'] )
+	test['size_tau2_200'] = np.sqrt( 0.66/ test['trade_order_count_sum'] )
+
+	# delta tau
+	train['size_tau2_d'] = train['size_tau2_400'] - train['size_tau2']
+	test['size_tau2_d'] = test['size_tau2_400'] - test['size_tau2']
+
+	return train, test
 
 def era_projection(train, test):
 
@@ -304,367 +362,6 @@ def rmspe(y_true, y_pred):
 def feval_rmspe(y_pred, lgb_train):
 	y_true = lgb_train.get_label()
 	return 'RMSPE', rmspe(y_true, y_pred), False
-
-def train_and_evaluate(train, test, seed=29, folds=5, save_model=True):
-	# Hyperparammeters (optimized)
-	
-	params = {
-		'learning_rate': 0.1,
-		'lambda_l1': 2,
-		'lambda_l2': 7,
-		'num_leaves': 1000,
-		'min_sum_hessian_in_leaf': 20,
-		'feature_fraction': 0.8,
-		'feature_fraction_bynode': 0.8,
-		'bagging_fraction': 0.9,
-		'bagging_freq': 42,
-		'min_data_in_leaf': 700,
-		'max_depth': 5,
-		'seed': seed,
-		'feature_fraction_seed': seed,
-		'bagging_seed': seed,
-		'drop_seed': seed,
-		'data_random_seed': seed,
-		'objective': 'rmse',
-		'boosting': 'gbdt',
-		'verbosity': -1,
-		'n_jobs': -1,
-	}   
-	
-	# Split features and target
-	correlations = train.corrwith(train.target).abs()
-	predictors = list(correlations[correlations > 0.5].index.drop('target')) + ['stock_id', 'time_id']
-
-	x = train[predictors]
-	y = train['target']
-	x_test = test[predictors]
-	# Transform stock id to a numeric value
-	x['stock_id'] = x['stock_id'].astype(int)
-	x_test['stock_id'] = x_test['stock_id'].astype(int)
-	
-	# Create out of folds array
-	oof_predictions = np.zeros(x.shape[0])
-	# Create test array to store predictions
-	test_predictions = np.zeros(x_test.shape[0])
-	# Create a KFold object
-	kfold = KFold(n_splits=folds, random_state=1111, shuffle=True)
-	# Iterate through each fold
-	for fold, (trn_ind, val_ind) in enumerate(kfold.split(x)):
-		print(f'Training fold {fold + 1}')
-		x_train, x_val = x.iloc[trn_ind], x.iloc[val_ind]
-		y_train, y_val = y.iloc[trn_ind], y.iloc[val_ind]
-		#x_train, x_val = era_projection(x_train, x_val)
-		#x_train = x_train.sort_values(by=['stock_id', 'time_id'])
-		#x_val = x_val.sort_values(by=['stock_id', 'time_id'])
-		#x_train.drop(columns=['time_id'], inplace=True)
-		#x_val.drop(columns=['time_id'], inplace=True)
-		# Root mean squared percentage error weights
-		train_weights = 1 / np.square(y_train)
-		val_weights = 1 / np.square(y_val)
-		train_dataset = lgb.Dataset(x_train, y_train, weight = train_weights, categorical_feature = ['stock_id'])
-		val_dataset = lgb.Dataset(x_val, y_val, weight = val_weights, categorical_feature = ['stock_id'])
-		model = lgb.train(params = params, 
-						  train_set = train_dataset, 
-						  valid_sets = [train_dataset, val_dataset], 
-						  num_boost_round = 6000, 
-						  early_stopping_rounds = 300, 
-						  verbose_eval = 100,
-						  feval = feval_rmspe)
-
-		#if save_model:
-		#    model.booster_.save_model(models_dir + 'lgbm_' + str(fold) + '.txt')
-			# To load the model use:
-			# model = lgb.Booster(model_file='mode.txt')
-
-		plt.figure(figsize=(12,6))
-		lgb.plot_importance(model, max_num_features=10)
-		plt.title("Feature importance")
-		plt.show()
-		# Add predictions to the out of folds array
-		oof_predictions[val_ind] = model.predict(x_val)
-		# Predict the test set
-		#test_predictions += model.predict(x_test) / 20
-
-	rmspe_score = rmspe(y, oof_predictions)
-	print(f'Our out of folds RMSPE is {rmspe_score}')
-	# Return test predictions
-	return test_predictions
-
-# Prepare data for Pytorch MDN Model
-
-def data_load(X_train, y_train, X_test, y_test, batch_size=32):
-
-	train_data = TensorDataset(torch.from_numpy(X_train).float().to(device), torch.from_numpy(y_train).float().to(device))
-	test_data = TensorDataset(torch.from_numpy(X_test).float().to(device), torch.from_numpy(y_test).float().to(device))
-
-	train_dataloader = DataLoader(train_data, batch_size=batch_size, shuffle=True)
-	test_dataloader = DataLoader(test_data, batch_size=batch_size, shuffle=True)
-
-	return train_dataloader, test_dataloader
-
-class MDN_model(nn.Module):
-	def __init__(self, n_features, n_gaussians=3):
-		super(MDN_model, self).__init__()
-		
-		self.n_features = n_features
-		self.silu = nn.SiLU()
-
-		self.linear1 = nn.Linear(n_features, 64)
-		self.linear2 = nn.Linear(64, 32)
-		self.linear3 = nn.Linear(32, 16)
-		self.mix_density = nn.MDN(16, 1, n_gaussians)
-
-	def forward(self, x):
-		output = self.linear1(x)
-		output = self.silu(output)
-		output = self.linear2(output)
-		output = self.silu(output)
-		output = self.linear3(output)
-		output = self.silu(output)
-		output = self.mix_density(output)
-
-		return output
-
-class InvGamma_model(nn.Module):
-	def __init__(self, n_features):
-		super(InvGamma_model, self).__init__()
-		
-		self.n_features = n_features
-		self.silu = nn.SiLU()
-		self.linear1 = nn.Linear(n_features, 64)
-		self.linear2 = nn.Linear(64, 32)
-		self.linear3 = nn.Linear(32, 16)
-		self.density = mdn.InvGamma(16)
-
-	def forward(self, x):
-		output = self.linear1(x)
-		output = self.silu(output)
-		output = self.linear2(output)
-		output = self.silu(output)
-		output = self.linear3(output)
-		output = self.silu(output)
-		output = self.density(output)
-
-		return output
-
-
-def get_predictions(alpha, sigma):
-	n = alpha.shape[0]
-	preds = np.zeros(n)
-
-	for i in range(n):
-		sample_gamma = invgamma.rvs(alpha[i], loc=0, scale=sigma[i], size=1000)
-		inv_expected_value = ( 1 / sample_gamma ).mean()
-		inv_variance = ( 1 / (sample_gamma**2) ).mean()
-
-		preds[i] = inv_expected_value / inv_variance
-
-	return preds
-
-
-def train_and_evaluate_InvGamma(train, test, seed=29, folds=5, epochs=40, save_model=True):
-
-	# Split features and target
-	correlations = train.corrwith(train.target).abs()
-	predictors = list(correlations[correlations > 0.5].index.drop('target')) + ['stock_id', 'time_id']
-
-	x = train[predictors]
-	y = train['target']
-	x_test = test[predictors]
-	# Transform stock id to a numeric value
-	x['stock_id'] = x['stock_id'].astype(int)
-	x_test['stock_id'] = x_test['stock_id'].astype(int)
-
-	# Create out of folds array
-	oof_predictions = np.zeros(x.shape[0])
-	# Create test array to store predictions
-	test_predictions = np.zeros(x_test.shape[0])
-	# Create a KFold object
-	kfold = KFold(n_splits=folds, random_state=1111, shuffle=True)
-	# Iterate through each fold	
-
-	for fold, (trn_ind, val_ind) in enumerate(kfold.split(x)):
-		print(f'Training fold {fold + 1}')
-		x_train, x_val = x.iloc[trn_ind], x.iloc[val_ind]
-		y_train, y_val = y.iloc[trn_ind].values, y.iloc[val_ind].values
-
-		scaler = MinMaxScaler(feature_range=(0,1))
-		x_train = scaler.fit_transform(x_train)
-		x_val = scaler.transform(x_val)
-		model = InvGamma_model(x_train.shape[1])
-
-		train_dataloader, val_dataloader = data_load(x_train, y_train, x_val, y_val)
-		model.cuda()
-		optimizer = optim.Adam(model.parameters())
-
-		# train the model
-		model.train()
-		for epoch in range(epochs):
-			train_loss = 0
-			counter = 0
-			for inputs, labels in train_dataloader:
-				inputs, labels = inputs.to(device), labels.to(device)
-				model.zero_grad()
-				alpha, sigma = model(inputs)
-				loss = mdn.inv_gamma_loss(alpha, sigma, labels)
-				train_loss += loss.item()
-				loss.backward()
-				optimizer.step()
-				counter += 1
-
-			print('TRAIN | Epoch: {}/{} | Loss: {:.8f}'.format(epoch+1, epochs, train_loss / counter))
-
-		model.eval()
-		val_tensor = torch.tensor(x_val, dtype=torch.float).to(device)
-		alpha, sigma = model(val_tensor)
-		alpha, sigma = alpha.detach().cpu().numpy(), sigma.detach().cpu().numpy()
-		# Add predictions to the out of folds array
-		oof_predictions[val_ind] = get_predictions(alpha, sigma)
-		# Predict the test set
-		#test_predictions += model.predict(x_test) / 20
-
-		#if save_model:
-		#    model.booster_.save_model(models_dir + 'lgbm_' + str(fold) + '.txt')
-			# To load the model use:
-			# model = lgb.Booster(model_file='mode.txt')
-
-
-	rmspe_score = rmspe(y, oof_predictions)
-	print(f'Our out of folds RMSPE is {rmspe_score}')
-	# Return test predictions
-	return test_predictions
-
-
-def train_and_evaluate_MDN(train, test, seed=29, folds=5, epochs=40, save_model=True):
-
-	# Split features and target
-	correlations = train.corrwith(train.target).abs()
-	predictors = list(correlations[correlations > 0.5].index.drop('target')) + ['stock_id', 'time_id']
-
-	x = train[predictors]
-	y = train['target']
-	x_test = test[predictors]
-	# Transform stock id to a numeric value
-	x['stock_id'] = x['stock_id'].astype(int)
-	x_test['stock_id'] = x_test['stock_id'].astype(int)
-
-	# Create out of folds array
-	oof_predictions = np.zeros(x.shape[0])
-	# Create test array to store predictions
-	test_predictions = np.zeros(x_test.shape[0])
-	# Create a KFold object
-	kfold = KFold(n_splits=folds, random_state=seed, shuffle=True)
-	# Iterate through each fold
-
-	device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-	for fold, (trn_ind, val_ind) in enumerate(kfold.split(x)):
-		print(f'Training fold {fold + 1}')
-		x_train, x_val = x.iloc[trn_ind], x.iloc[val_ind]
-		y_train, y_val = y.iloc[trn_ind].values, y.iloc[val_ind].values
-
-		scaler = MinMaxScaler(feature_range=(0,1))
-		x_train = scaler.fit_transform(x_train)
-		x_val = scaler.transform(x_val)
-		model = MDN_model(x_train.shape[1])
-
-		train_dataloader, val_dataloader = data_load(x_train, y_train, x_val, y_val)
-		model.cuda()
-		optimizer = optim.Adam(model.parameters())
-
-		# train the model
-		model.train()
-		for epoch in range(epochs):
-			train_loss = 0
-			counter = 0
-			for inputs, labels in train_dataloader:
-				model.zero_grad()
-				pi, sigma, mu = model(inputs)
-				loss = mdn.mdn_loss(pi, sigma, mu, labels)
-				train_loss += loss.item()
-				loss.backward()
-				optimizer.step()
-				counter += 1
-
-			print('TRAIN | Epoch: {}/{} | Loss: {:.8f}'.format(epoch+1, epochs, train_loss / counter))
-
-		model.eval()
-		val_tensor = torch.tensor(x_val, dtype=torch.float).to(device)
-		pi, sigma, mu = model(val_tensor)
-		pi, sigma, mu = torch.exp(pi).detach().cpu().numpy(), torch.exp(sigma).detach().cpu().numpy(), torch.exp(mu).detach().cpu().numpy()
-		# Add predictions to the out of folds array
-		oof_predictions[val_ind] = get_predictions(pi, sigma, mu)
-		# Predict the test set
-		#test_predictions += model.predict(x_test) / 20
-
-		#if save_model:
-		#    model.booster_.save_model(models_dir + 'lgbm_' + str(fold) + '.txt')
-			# To load the model use:
-			# model = lgb.Booster(model_file='mode.txt')
-
-
-	rmspe_score = rmspe(y, oof_predictions)
-	print(f'Our out of folds RMSPE is {rmspe_score}')
-	# Return test predictions
-	return test_predictions
-
-
-def train_and_evaluate_ctb(train, test):
-
-	seed = 29    
-	# Split features and target
-	x = train.drop(['row_id', 'target', 'time_id'], axis = 1)
-	y = train['target']
-	x_test = test.drop(['row_id', 'time_id'], axis = 1)
-	# Transform stock id to a numeric value
-	x['stock_id'] = x['stock_id'].astype(int)
-	x_test['stock_id'] = x_test['stock_id'].astype(int)
-	
-	# Create out of folds array
-	oof_predictions = np.zeros(x.shape[0])
-	# Create test array to store predictions
-	test_predictions = np.zeros(x_test.shape[0])
-	# Create a KFold object
-	kfold = KFold(n_splits = 20, random_state = 1111, shuffle = True)
-	# Iterate through each fold
-	
-	cat_vars = ['stock_id']
-	cat_indexes = [train.columns.get_loc(x) for x in cat_vars]
-	
-	for fold, (trn_ind, val_ind) in enumerate(kfold.split(x)):
-		print(f'Training fold {fold + 1}')
-		x_train, x_val = x.iloc[trn_ind], x.iloc[val_ind]
-		y_train, y_val = y.iloc[trn_ind], y.iloc[val_ind]
-		# Root mean squared percentage error weights
-		train_weights = 1 / np.square(y_train)
-		val_weights = 1 / np.square(y_val)
-		
-		train_pool = ctb.Pool(x_train, y_train, weight=train_weights, cat_features=cat_indexes)
-		val_pool = ctb.Pool(x_val, y_val, weight=val_weights, cat_features=cat_indexes)
-		
-		model = ctb.CatBoostRegressor(num_boost_round = 5000,                              
-							   l2_leaf_reg = 7,
-							   depth = 7,
-							   max_bin = 40,
-							   rsm = 0.7,
-							   use_best_model = True,
-							   one_hot_max_size = 30,
-							   #logging_level = "Silent",
-							   random_seed = seed)
-		
-		model.fit(train_pool, eval_set=val_pool, early_stopping_rounds=300)
-
-		feat_imp = pd.Series(model.feature_importances_, x_train.columns).sort_values(ascending=False)[:10]
-		feat_imp.plot(kind = 'bar', title = 'Feature Importance')
-		# Add predictions to the out of folds array
-		oof_predictions[val_ind] = model.predict(x_val)
-		# Predict the test set
-		test_predictions += model.predict(x_test) / 20
-		
-	rmspe_score = rmspe(y, oof_predictions)
-	print(f'Our out of folds RMSPE is {rmspe_score}')
-	# Return test predictions
-	return test_predictions
 
 
 ########################################## USAGE #############################################
