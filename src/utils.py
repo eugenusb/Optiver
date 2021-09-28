@@ -46,8 +46,35 @@ def realized_volatility(series):
 def count_unique(series):
 	return len(np.unique(series))
 
-# Function to calculate the GARCH volatility estimation
+# Calculate the realized skew
+def realized_skew(series):
+	return np.sqrt(series.count())*np.sum(series**3)/(realized_volatility(series)**3)
 
+# Calculate the realized kurtosis
+def realized_kurtosis(series):
+	return series.count()*np.sum(series**4)/(realized_volatility(series)**4)
+
+# Calculate integrated quarticity
+def realized_quarticity(series):
+	return (series.count()/3)*np.sum(series**4)
+
+# Calculate order book depth
+def calc_depth(df):
+	depth = df['bid_price1'] * df['bid_size1'] + df['ask_price1'] * df['ask_size1'] + df['bid_price2'] * df['bid_size2'] + df['ask_price2'] * df['ask_size2']
+	return depth
+
+# Calculate order book slope
+def calc_slope(df):
+	v0 = (df['bid_size1']+df['ask_size1'])/2
+	p0 = (df['bid_price1']+df['ask_price1'])/2
+	slope_bid = ((df['bid_size1']/v0)-1)/abs((df['bid_price1']/p0)-1)+(
+				(df['bid_size2']/df['bid_size1'])-1)/abs((df['bid_price2']/df['bid_price1'])-1)
+	slope_ask = ((df['ask_size1']/v0)-1)/abs((df['ask_price1']/p0)-1)+(
+				(df['ask_size2']/df['ask_size1'])-1)/abs((df['ask_price2']/df['ask_price1'])-1)
+	return (slope_bid+slope_ask)/2, abs(slope_bid-slope_ask)
+
+
+# Function to calculate the GARCH volatility estimation
 df_sec = pd.DataFrame()
 df_sec['seconds'] = np.arange(0,601)
 
@@ -84,6 +111,7 @@ def book_preprocessor(file_path):
 	df['wap2'] = calc_wap2(df)
 	df['wap3'] = calc_wap3(df)
 	df['wap4'] = calc_wap4(df)
+	df['depth'] = calc_depth(df)
 	#df = df.groupby(['time_id']).apply(garch_est)
 	# Calculate squared difference in time
 	df['time_diff'] = df.groupby(['time_id'])['seconds_in_bucket'].diff()
@@ -112,10 +140,11 @@ def book_preprocessor(file_path):
 		'wap2': [np.sum, np.mean, np.std],
 		'wap3': [np.sum, np.mean, np.std],
 		'wap4': [np.sum, np.mean, np.std],
-		'log_return1': [np.sum, realized_volatility, np.mean, np.std],
-		'log_return2': [np.sum, realized_volatility, np.mean, np.std],
-		'log_return3': [np.sum, realized_volatility, np.mean, np.std],
-		'log_return4': [np.sum, realized_volatility, np.mean, np.std],
+		'depth': [np.sum, np.mean, np.std],
+		'log_return1': [np.sum, realized_volatility, realized_skew, realized_skew, realized_kurtosis, realized_quarticity, np.mean, np.std],
+		'log_return2': [np.sum, realized_volatility, realized_skew, realized_skew, realized_kurtosis, realized_quarticity, np.mean, np.std],
+		'log_return3': [np.sum, realized_volatility, realized_skew, realized_skew, realized_kurtosis, realized_quarticity, np.mean, np.std],
+		'log_return4': [np.sum, realized_volatility, realized_skew, realized_skew, realized_kurtosis, realized_quarticity, np.mean, np.std],
 		'wap_balance': [np.sum, np.mean, np.std],
 		'price_spread':[np.sum, np.mean, np.std],
 		'price_spread2':[np.sum, np.mean, np.std],
@@ -127,10 +156,10 @@ def book_preprocessor(file_path):
 		'instant_volatility': [realized_volatility],
 	}
 	create_feature_dict_time = {
-		'log_return1': [realized_volatility],
-		'log_return2': [realized_volatility],
-		'log_return3': [realized_volatility],
-		'log_return4': [realized_volatility],        
+		'log_return1': [realized_volatility,realized_skew, realized_skew, realized_kurtosis],
+		'log_return2': [realized_volatility,realized_skew, realized_skew, realized_kurtosis],
+		'log_return3': [realized_volatility,realized_skew, realized_skew, realized_kurtosis],
+		'log_return4': [realized_volatility,realized_skew, realized_skew, realized_kurtosis],
 	}
 	
 	# Function to get group stats for different windows (seconds in bucket)
@@ -143,7 +172,7 @@ def book_preprocessor(file_path):
 		if add_suffix:
 			df_feature = df_feature.add_suffix('_' + str(seconds_in_bucket))
 		return df_feature
-	
+
 	# Get the stats for different windows
 	df_feature = get_stats_window(create_feature_dict,seconds_in_bucket = 0, add_suffix = False)	
 	df_feature_450 = get_stats_window(create_feature_dict_time, seconds_in_bucket = 450, add_suffix = True)

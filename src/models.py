@@ -13,8 +13,12 @@ get_custom_objects().update({'swish': Activation(swish)})
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingWarmRestarts
 from torch.utils.data import TensorDataset, DataLoader
+from pytorch_tabnet.metrics import Metric
+from pytorch_tabnet.tab_model import TabNetRegressor
 from . import mdn
+from . import mdn_keras
 from scipy.stats import invgamma
 from sklearn.metrics import mean_squared_error
 from sklearn.model_selection import KFold
@@ -22,7 +26,7 @@ import lightgbm as lgb
 import catboost as ctb
 import seaborn as sns
 import umap
-from sklearn.preprocessing import MinMaxScaler, StandardScaler
+from sklearn.preprocessing import MinMaxScaler, StandardScaler, LabelEncoder
 from .utils import *
 
 early_stop = tf.keras.callbacks.EarlyStopping(
@@ -71,10 +75,44 @@ def get_predictions(alpha, sigma):
 
 	return preds
 
+def get_predictions_MDN(params, n_gaussians=3):
+	print('Starting sampling from mixture of gaussians....')
+
+	n = params.shape[0]
+	preds = np.zeros(n)
+
+	for i in range(n):
+		mus, sigs, pi_logits = mdn_keras.split_mixture_params(params[i], 1, n_gaussians)
+		pis = mdn_keras.softmax(pi_logits)		
+		simul = np.zeros(1000)
+		cat = np.random.choice(a=np.arange(0,n_gaussians), p=pis, size=1000)
+		mus_sample = np.array([mus[c] for c in cat])
+		sigs_sample = np.array([sigs[c] for c in cat])
+		for j in range(1000):
+			simul[j] = np.random.normal(mus_sample[j],sigs_sample[j])
+
+		inv_expected_value = ( 1 / simul ).mean()
+		inv_variance = ( 1 / (simul**2) ).mean()
+
+		preds[i] = inv_expected_value / inv_variance
+
+	return preds
+
 def mspe_loss(output, target):
 	loss = torch.mean(((output - target)/target)**2)
 	return loss
 
+class RMSPE(Metric):
+	def __init__(self):
+		self._name = "rmspe"
+		self._maximize = False
+
+	def __call__(self, y_true, y_score):
+		
+		return np.sqrt(np.mean(np.square((y_true - y_score) / y_true)))
+	
+def RMSPELoss(y_pred, y_true):
+	return torch.sqrt(torch.mean( ((y_true - y_pred) / y_true) ** 2 )).clone()
 
 class MDN_model(nn.Module):
 	def __init__(self, n_features, n_gaussians=3):
@@ -153,7 +191,6 @@ class FFNN(nn.Module):
 
 		return output
 
-
 #############################################################################################
 # KERAS MODELS
 #############################################################################################
@@ -170,7 +207,7 @@ def base_model(n_features, tam):
 	stock_embedded = keras.layers.Embedding(tam, stock_embedding_size, input_length=1, name='stock_embedding')(stock_id_input)
 	stock_flattened = keras.layers.Flatten()(stock_embedded)
 	out = keras.layers.Concatenate()([stock_flattened, num_input])
-	
+
 	# Add one or more hidden layers
 	for n_hidden in hidden_units:
 		out = keras.layers.Dense(n_hidden, activation='swish')(out)       
@@ -181,6 +218,44 @@ def base_model(n_features, tam):
 	model = keras.Model(inputs=[num_input, stock_id_input], outputs=out,)
 
 	return model
+
+def mdn_keras_model(n_features, tam, n_gaussians=3):
+	num_input = keras.Input(shape=(n_features,), name='num_data')
+	stock_id_input = keras.Input(shape=(1,), name='stock_id')	
+
+	#embedding, flatenning and concatenating
+	stock_embedded = keras.layers.Embedding(tam, stock_embedding_size, input_length=1, name='stock_embedding')(stock_id_input)
+	stock_flattened = keras.layers.Flatten()(stock_embedded)
+	out = keras.layers.Concatenate()([stock_flattened, num_input])
+
+	# Add one or more hidden layers
+	for n_hidden in hidden_units:
+		out = keras.layers.Dense(n_hidden, activation='swish')(out)
+	out = mdn_keras.MDN_Keras(1, n_gaussians)(out)
+
+	model = keras.Model(inputs=[num_input, stock_id_input], outputs=out,)	
+
+	return model
+
+
+def invgamma_keras_model(n_features, tam):
+	num_input = keras.Input(shape=(n_features,), name='num_data')
+	stock_id_input = keras.Input(shape=(1,), name='stock_id')	
+
+	#embedding, flatenning and concatenating
+	stock_embedded = keras.layers.Embedding(tam, stock_embedding_size, input_length=1, name='stock_embedding')(stock_id_input)
+	stock_flattened = keras.layers.Flatten()(stock_embedded)
+	out = keras.layers.Concatenate()([stock_flattened, num_input])
+
+	# Add one or more hidden layers
+	for n_hidden in hidden_units:
+		out = keras.layers.Dense(n_hidden, activation='swish')(out)
+	out = mdn_keras.InvGamma_Keras()(out)
+
+	model = keras.Model(inputs=[num_input, stock_id_input], outputs=out)
+
+	return model
+
 
 def train_and_evaluate_NN(train, test, folds=5, save_model=True):
 	predictors = [col for col in list(train.columns) if col not in {"stock_id", "time_id", "target", "row_id"}]
@@ -224,7 +299,7 @@ def train_and_evaluate_NN(train, test, folds=5, save_model=True):
 		model = base_model(x_train.shape[1], tam)
 		model.compile(keras.optimizers.Adam(learning_rate=0.006), loss=root_mean_squared_per_error)
 
-		scaler = MinMaxScaler(feature_range=(-1, 1))         
+		scaler = MinMaxScaler(feature_range=(0, 1))         
 		x_train = scaler.fit_transform(x_train.values)
 		x_val = scaler.transform(x_val.values)
 
@@ -233,10 +308,120 @@ def train_and_evaluate_NN(train, test, folds=5, save_model=True):
 
 		oof_predictions[val_ind] = model.predict([x_val, stock_val]).reshape(-1)
 
-		rmspe_score = rmspe(y, oof_predictions)
-		print(f'Our out of folds RMSPE is {rmspe_score}')
+	rmspe_score = rmspe(y, oof_predictions)
+	print(f'Our out of folds RMSPE is {rmspe_score}')
 
 	return oof_predictions
+
+def train_and_evaluate_MDN_keras(train, test, folds=5, n_gaussians=3, epochs=1000, save_model=True):
+	predictors = [col for col in list(train.columns) if col not in {"stock_id", "time_id", "target", "row_id"}]
+
+	train.replace([np.inf, -np.inf], np.nan,inplace=True)
+	test.replace([np.inf, -np.inf], np.nan,inplace=True)    
+	x = train[predictors]
+	stocks = train['stock_id']
+	y = train['target']
+	test = test[predictors]
+
+	tam = stocks.unique().max()+1
+
+	# for col in predictors:
+	# qt_train = []
+	# qt = QuantileTransformer(random_state=21,n_quantiles=2000, output_distribution='normal')
+	# train_nn[col] = qt.fit_transform(train_nn[[col]])
+	# test_nn[col] = qt.transform(test_nn[[col]])    
+	# qt_train.append(qt)
+
+	# Create out of folds array
+	oof_predictions = np.zeros(x.shape[0])
+	# Create test array to store predictions
+	test_predictions = np.zeros(test.shape[0])
+	# Create a KFold object
+	kfold = KFold(n_splits=folds, shuffle=True, random_state=2020)
+
+	train[predictors] = train[predictors].fillna(train[predictors].mean())
+	test[predictors] = test[predictors].fillna(train[predictors].mean())
+
+	for fold, (trn_ind, val_ind) in enumerate(kfold.split(x)):
+		print(f'Training fold {fold + 1}')
+		x_train, x_val = x.iloc[trn_ind], x.iloc[val_ind]
+		stock_train, stock_val = stocks.iloc[trn_ind], stocks.iloc[val_ind]
+		y_train, y_val = y.iloc[trn_ind], y.iloc[val_ind]
+
+		#############################################################################################
+		# MDN
+		#############################################################################################
+
+		model = mdn_keras_model(x_train.shape[1], tam)
+		model.compile(loss=mdn_keras.get_mixture_loss_func(1, n_gaussians), optimizer=keras.optimizers.Adam())
+
+		scaler = MinMaxScaler(feature_range=(0, 1))         
+		x_train = scaler.fit_transform(x_train.values)
+		x_val = scaler.transform(x_val.values)
+
+		model.fit([x_train, stock_train], y_train, batch_size=2048, epochs=epochs, validation_data=([x_val, stock_val], y_val),
+					callbacks=[early_stop, plateau], shuffle=True, verbose = 1)
+
+		oof_predictions[val_ind] = get_predictions_MDN(model.predict([x_val, stock_val]), n_gaussians)
+
+	rmspe_score = rmspe(y, oof_predictions)
+	print(f'Our out of folds RMSPE is {rmspe_score}')
+
+	return oof_predictions
+
+
+def train_and_evaluate_InvGamma_keras(train, test, folds=5, n_gaussians=3, epochs=1000, save_model=True):
+	predictors = [col for col in list(train.columns) if col not in {"stock_id", "time_id", "target", "row_id"}]
+
+	train.replace([np.inf, -np.inf], np.nan,inplace=True)
+	test.replace([np.inf, -np.inf], np.nan,inplace=True)    
+	x = train[predictors]
+	stocks = train['stock_id']
+	y = 1000*train['target']
+	test = test[predictors]
+
+	tam = stocks.unique().max()+1
+
+	# Create out of folds array
+	oof_predictions = np.zeros(x.shape[0])
+	# Create test array to store predictions
+	test_predictions = np.zeros(test.shape[0])
+	# Create a KFold object
+	kfold = KFold(n_splits=folds, shuffle=True, random_state=2020)
+
+	train[predictors] = train[predictors].fillna(train[predictors].mean())
+	test[predictors] = test[predictors].fillna(train[predictors].mean())
+
+	for fold, (trn_ind, val_ind) in enumerate(kfold.split(x)):
+		print(f'Training fold {fold + 1}')
+		x_train, x_val = x.iloc[trn_ind], x.iloc[val_ind]
+		stock_train, stock_val = stocks.iloc[trn_ind], stocks.iloc[val_ind]
+		y_train, y_val = y.iloc[trn_ind], y.iloc[val_ind]
+
+		#############################################################################################
+		# Inv Gamma
+		#############################################################################################
+
+		model = invgamma_keras_model(x_train.shape[1], tam)
+		model.compile(loss=mdn_keras.inv_gamma_loss, optimizer=keras.optimizers.Adam())
+
+		scaler = MinMaxScaler(feature_range=(0, 1))         
+		x_train = scaler.fit_transform(x_train.values)
+		x_val = scaler.transform(x_val.values)
+
+		model.fit([x_train, stock_train], y_train, batch_size=2048, epochs=epochs, validation_data=([x_val, stock_val], y_val),
+					callbacks=[early_stop, plateau], shuffle=True, verbose = 1)
+
+		output = model.predict([x_val, stock_val])
+		alpha, sigma = output[:,0], output[:,1]
+		oof_predictions[val_ind] = get_predictions(alpha, sigma)
+		fold_score = rmspe(y_val, oof_predictions[val_ind])
+		print(f'Fold RMSPE score {fold_score}')
+	rmspe_score = rmspe(y, oof_predictions)
+	print(f'Our out of folds RMSPE is {rmspe_score}')
+
+	return oof_predictions
+
 
 def train_and_evaluate(train, test, seed=29, folds=5, log=False, save_model=True):
 	# Hyperparammeters (optimized)
@@ -548,7 +733,7 @@ def train_and_evaluate_MDN(train, test, seed=29, folds=5, epochs=40, save_model=
 
 def train_and_evaluate_ctb(train, test, folds=5):
 
-	seed = 29    
+	seed = 29
 	# Split features and target
 	x = train.drop(['row_id', 'target', 'time_id'], axis = 1)
 	y = train['target']
@@ -602,3 +787,104 @@ def train_and_evaluate_ctb(train, test, folds=5):
 	print(f'Our out of folds RMSPE is {rmspe_score}')
 	# Return test predictions
 	return test_predictions
+
+
+def tabnet_model(train, test, folds=5, save_model=True):
+
+	# Split features and target
+	x = train.drop(['row_id', 'target', 'time_id'], axis = 1)
+	y = train['target']
+
+	x_test = test.drop(['row_id', 'time_id'], axis = 1)
+	# Transform stock id to a numeric value
+	x['stock_id'] = x['stock_id'].astype(int)
+	x_test['stock_id'] = x_test['stock_id'].astype(int)
+
+	# Prepare data: encode categorical columns and scale the other ones
+
+	categorical_columns = []
+	categorical_dims =  {}
+
+	for col in x.columns:
+		if  col == 'stock_id':
+			l_enc = LabelEncoder()
+			x[col] = l_enc.fit_transform(x[col].values)
+			x_test[col] = l_enc.transform(x_test[col].values)
+			categorical_columns.append(col)
+			categorical_dims[col] = len(l_enc.classes_)
+		else:
+			scaler = StandardScaler()
+			x[col] = scaler.fit_transform(x[col].values.reshape(-1, 1))
+			x_test[col] = scaler.transform(x_test[col].values.reshape(-1, 1))
+
+	cat_idxs = [ i for i, f in enumerate(x.columns.tolist()) if f in categorical_columns]
+	cat_dims = [ categorical_dims[f] for i, f in enumerate(x.columns.tolist()) if f in categorical_columns]
+
+	tabnet_params = dict(
+		cat_idxs=cat_idxs,
+		cat_dims=cat_dims,
+		cat_emb_dim=1,
+		n_d = 16,
+		n_a = 16,
+		n_steps = 2,
+		gamma = 2,
+		n_independent = 2,
+		n_shared = 2,
+		lambda_sparse = 0,
+		optimizer_fn = optim.Adam,
+		optimizer_params = dict(lr = (2e-2)),
+		mask_type = "entmax",
+		scheduler_params = dict(T_0=200, T_mult=1, eta_min=1e-4, last_epoch=-1, verbose=False),
+		scheduler_fn = CosineAnnealingWarmRestarts,
+		seed = 42,
+		verbose = 10
+	)
+
+	kfold = KFold(n_splits=folds, random_state=42, shuffle=True)
+	
+	# Create out of folds array
+	oof_predictions = np.zeros(x.shape[0])
+	feature_importances = pd.DataFrame()
+	feature_importances["feature"] = x.columns.tolist()
+	stats = pd.DataFrame()
+	explain_matrices = []
+	masks_ = []
+
+	for fold, (trn_ind, val_ind) in enumerate(kfold.split(x)):
+		print(f'Training fold {fold + 1}')
+		x_train, x_val = x.iloc[trn_ind].values, x.iloc[val_ind].values
+		y_train, y_val = y.iloc[trn_ind].values.reshape(-1,1), y.iloc[val_ind].values.reshape(-1,1)
+
+		tabnet =  TabNetRegressor(**tabnet_params)
+		tabnet.fit(
+		  x_train, y_train,
+		  eval_set=[(x_val, y_val)],
+		  max_epochs = 200,
+		  patience = 50,
+		  batch_size = 1024*20, 
+		  virtual_batch_size = 128*20,
+		  num_workers = 4,
+		  drop_last = False,
+		  eval_metric=[RMSPE],
+		  loss_fn=RMSPELoss
+		  )
+
+		if save_model:
+			saving_path_name = f"./fold{fold}"
+			saved_filepath = tabnet.save_model(saving_path_name)
+
+		#explain_matrix, masks = tabnet.explain(x_val)
+		#explain_matrices.append(explain_matrix)
+		#masks_.append(masks[0])
+		#masks_.append(masks[1])
+
+		oof_predictions[val_ind] = tabnet.predict(x_val).reshape(-1)
+		#feature_importances[f"importance_fold{fold}+1"] = tabnet.feature_importances_
+
+		#stats[f'fold{fold+1}_train_rmspe'] = tabnet.history['loss']
+		#stats[f'fold{fold+1}_val_rmspe'] = tabnet.history['val_0_rmspe']
+
+	print(f'Our out of folds RMSPE is: {rmspe(y, oof_predictions.flatten())}')
+
+	return oof_predictions
+	#return oof_predictions, stats, explain_matrices, masks_, feature_importances
