@@ -195,9 +195,8 @@ class FFNN(nn.Module):
 # KERAS MODELS
 #############################################################################################
 
-
 def root_mean_squared_per_error(y_true, y_pred):
-		 return K.sqrt(K.mean(K.square( (y_true - y_pred)/ y_true )))
+	return K.sqrt(K.mean(K.square( (y_true - y_pred)/ y_true )))
 
 def base_model(n_features, tam):
 	num_input = keras.Input(shape=(n_features,), name='num_data')
