@@ -29,6 +29,9 @@ import umap
 from sklearn.preprocessing import MinMaxScaler, StandardScaler, LabelEncoder
 from .utils import *
 
+# Model definitions, training routines and loss functions. Influenced by https://www.kaggle.com/mayangrui/lgbm-ffnn
+
+
 early_stop = tf.keras.callbacks.EarlyStopping(
 	monitor='val_loss', patience=20, verbose=0,
 	mode='min', restore_best_weights=True)
@@ -46,7 +49,7 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 # PYTORCH MODELS
 #############################################################################################
 
-# Prepare data for Pytorch MDN Model
+# Prepare data for Pytorch model
 
 def data_load(x_train, y_train, stocks_train, x_test, y_test, stocks_test, batch_size=1024, move_to_device=True):
 
@@ -113,29 +116,6 @@ class RMSPE(Metric):
 	
 def RMSPELoss(y_pred, y_true):
 	return torch.sqrt(torch.mean( ((y_true - y_pred) / y_true) ** 2 )).clone()
-
-class MDN_model(nn.Module):
-	def __init__(self, n_features, n_gaussians=3):
-		super(MDN_model, self).__init__()
-		
-		self.n_features = n_features
-		self.silu = nn.SiLU()
-
-		self.linear1 = nn.Linear(n_features, 64)
-		self.linear2 = nn.Linear(64, 32)
-		self.linear3 = nn.Linear(32, 16)
-		self.mix_density = nn.MDN(16, 1, n_gaussians)
-
-	def forward(self, x):
-		output = self.linear1(x)
-		output = self.silu(output)
-		output = self.linear2(output)
-		output = self.silu(output)
-		output = self.linear3(output)
-		output = self.silu(output)
-		output = self.mix_density(output)
-
-		return output
 
 class InvGamma_model(nn.Module):
 	def __init__(self, n_features, tam, stock_emb_dim=20):
@@ -218,25 +198,6 @@ def base_model(n_features, tam):
 
 	return model
 
-def mdn_keras_model(n_features, tam, n_gaussians=3):
-	num_input = keras.Input(shape=(n_features,), name='num_data')
-	stock_id_input = keras.Input(shape=(1,), name='stock_id')	
-
-	#embedding, flatenning and concatenating
-	stock_embedded = keras.layers.Embedding(tam, stock_embedding_size, input_length=1, name='stock_embedding')(stock_id_input)
-	stock_flattened = keras.layers.Flatten()(stock_embedded)
-	out = keras.layers.Concatenate()([stock_flattened, num_input])
-
-	# Add one or more hidden layers
-	for n_hidden in hidden_units:
-		out = keras.layers.Dense(n_hidden, activation='swish')(out)
-	out = mdn_keras.MDN_Keras(1, n_gaussians)(out)
-
-	model = keras.Model(inputs=[num_input, stock_id_input], outputs=out,)	
-
-	return model
-
-
 def invgamma_keras_model(n_features, tam):
 	num_input = keras.Input(shape=(n_features,), name='num_data')
 	stock_id_input = keras.Input(shape=(1,), name='stock_id')	
@@ -246,7 +207,6 @@ def invgamma_keras_model(n_features, tam):
 	stock_flattened = keras.layers.Flatten()(stock_embedded)
 	out = keras.layers.Concatenate()([stock_flattened, num_input])
 
-	# Add one or more hidden layers
 	for n_hidden in hidden_units:
 		out = keras.layers.Dense(n_hidden, activation='swish')(out)
 	out = mdn_keras.InvGamma_Keras()(out)
@@ -267,14 +227,6 @@ def train_and_evaluate_NN(train, test, folds=5, save_model=True):
 	test = test[predictors]
 
 	tam = stocks.unique().max()+1
-
-	# for col in predictors:
-	# qt_train = []
-	# qt = QuantileTransformer(random_state=21,n_quantiles=2000, output_distribution='normal')
-	# train_nn[col] = qt.fit_transform(train_nn[[col]])
-	# test_nn[col] = qt.transform(test_nn[[col]])    
-	# qt_train.append(qt)
-
 	# Create out of folds array
 	oof_predictions = np.zeros(x.shape[0])
 	# Create test array to store predictions
@@ -306,62 +258,6 @@ def train_and_evaluate_NN(train, test, folds=5, save_model=True):
 					callbacks=[early_stop, plateau], shuffle=True, verbose = 1)
 
 		oof_predictions[val_ind] = model.predict([x_val, stock_val]).reshape(-1)
-
-	rmspe_score = rmspe(y, oof_predictions)
-	print(f'Our out of folds RMSPE is {rmspe_score}')
-
-	return oof_predictions
-
-def train_and_evaluate_MDN_keras(train, test, folds=5, n_gaussians=3, epochs=1000, save_model=True):
-	predictors = [col for col in list(train.columns) if col not in {"stock_id", "time_id", "target", "row_id"}]
-
-	train.replace([np.inf, -np.inf], np.nan,inplace=True)
-	test.replace([np.inf, -np.inf], np.nan,inplace=True)    
-	x = train[predictors]
-	stocks = train['stock_id']
-	y = train['target']
-	test = test[predictors]
-
-	tam = stocks.unique().max()+1
-
-	# for col in predictors:
-	# qt_train = []
-	# qt = QuantileTransformer(random_state=21,n_quantiles=2000, output_distribution='normal')
-	# train_nn[col] = qt.fit_transform(train_nn[[col]])
-	# test_nn[col] = qt.transform(test_nn[[col]])    
-	# qt_train.append(qt)
-
-	# Create out of folds array
-	oof_predictions = np.zeros(x.shape[0])
-	# Create test array to store predictions
-	test_predictions = np.zeros(test.shape[0])
-	# Create a KFold object
-	kfold = KFold(n_splits=folds, shuffle=True, random_state=2020)
-
-	train[predictors] = train[predictors].fillna(train[predictors].mean())
-	test[predictors] = test[predictors].fillna(train[predictors].mean())
-
-	for fold, (trn_ind, val_ind) in enumerate(kfold.split(x)):
-		print(f'Training fold {fold + 1}')
-		x_train, x_val = x.iloc[trn_ind], x.iloc[val_ind]
-		stock_train, stock_val = stocks.iloc[trn_ind], stocks.iloc[val_ind]
-		y_train, y_val = y.iloc[trn_ind], y.iloc[val_ind]
-
-		#############################################################################################
-		# MDN
-		#############################################################################################
-
-		model = mdn_keras_model(x_train.shape[1], tam)
-		model.compile(loss=mdn_keras.get_mixture_loss_func(1, n_gaussians), optimizer=keras.optimizers.Adam())
-
-		scaler = MinMaxScaler(feature_range=(0, 1))         
-		x_train = scaler.fit_transform(x_train.values)
-		x_val = scaler.transform(x_val.values)
-
-		model.fit([x_train, stock_train], y_train, batch_size=2048, epochs=epochs, validation_data=([x_val, stock_val], y_val),
-					callbacks=[early_stop, plateau], shuffle=True, verbose = 1)
-
-		oof_predictions[val_ind] = get_predictions_MDN(model.predict([x_val, stock_val]), n_gaussians)
 
 	rmspe_score = rmspe(y, oof_predictions)
 	print(f'Our out of folds RMSPE is {rmspe_score}')
@@ -649,80 +545,6 @@ def train_and_evaluate_InvGamma(train, test, seed=29, folds=5, epochs=40, save_m
 		oof_predictions[val_ind] = get_predictions(alpha, sigma)
 		# Predict the test set
 		#test_predictions += model.predict(x_test) / 20
-
-	rmspe_score = rmspe(y, oof_predictions)
-	print(f'Our out of folds RMSPE is {rmspe_score}')
-	# Return test predictions
-	return test_predictions
-
-
-def train_and_evaluate_MDN(train, test, seed=29, folds=5, epochs=40, save_model=True):
-
-	# Split features and target
-	correlations = train.corrwith(train.target).abs()
-	predictors = list(correlations[correlations > 0.5].index.drop('target')) + ['stock_id', 'time_id']
-
-	x = train[predictors]
-	y = train['target']
-	x_test = test[predictors]
-	# Transform stock id to a numeric value
-	x['stock_id'] = x['stock_id'].astype(int)
-	x_test['stock_id'] = x_test['stock_id'].astype(int)
-
-	# Create out of folds array
-	oof_predictions = np.zeros(x.shape[0])
-	# Create test array to store predictions
-	test_predictions = np.zeros(x_test.shape[0])
-	# Create a KFold object
-	kfold = KFold(n_splits=folds, random_state=1111, shuffle=True)
-	# Iterate through each fold
-
-	device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-	for fold, (trn_ind, val_ind) in enumerate(kfold.split(x)):
-		print(f'Training fold {fold + 1}')
-		x_train, x_val = x.iloc[trn_ind], x.iloc[val_ind]
-		y_train, y_val = y.iloc[trn_ind].values, y.iloc[val_ind].values
-
-		scaler = MinMaxScaler(feature_range=(0,1))
-		x_train = scaler.fit_transform(x_train)
-		x_val = scaler.transform(x_val)
-		model = MDN_model(x_train.shape[1])
-
-		train_dataloader, val_dataloader = data_load(x_train, y_train, x_val, y_val)
-		model.cuda()
-		optimizer = optim.Adam(model.parameters())
-
-		# train the model
-		model.train()
-		for epoch in range(epochs):
-			train_loss = 0
-			counter = 0
-			for inputs, labels in train_dataloader:
-				model.zero_grad()
-				pi, sigma, mu = model(inputs)
-				loss = mdn.mdn_loss(pi, sigma, mu, labels)
-				train_loss += loss.item()
-				loss.backward()
-				optimizer.step()
-				counter += 1
-
-			print('TRAIN | Epoch: {}/{} | Loss: {:.8f}'.format(epoch+1, epochs, train_loss / counter))
-
-		model.eval()
-		val_tensor = torch.tensor(x_val, dtype=torch.float).to(device)
-		pi, sigma, mu = model(val_tensor)
-		pi, sigma, mu = torch.exp(pi).detach().cpu().numpy(), torch.exp(sigma).detach().cpu().numpy(), torch.exp(mu).detach().cpu().numpy()
-		# Add predictions to the out of folds array
-		oof_predictions[val_ind] = get_predictions(pi, sigma, mu)
-		# Predict the test set
-		#test_predictions += model.predict(x_test) / 20
-
-		#if save_model:
-		#    model.booster_.save_model(models_dir + 'lgbm_' + str(fold) + '.txt')
-			# To load the model use:
-			# model = lgb.Booster(model_file='mode.txt')
-
 
 	rmspe_score = rmspe(y, oof_predictions)
 	print(f'Our out of folds RMSPE is {rmspe_score}')

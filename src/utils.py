@@ -7,9 +7,12 @@ import matplotlib.pyplot as plt
 import scipy as sc
 from arch import arch_model
 
-
 import warnings
 warnings.filterwarnings('ignore')
+
+
+# Data processing routines. Taken mainly from https://www.kaggle.com/mayangrui/lgbm-ffnn
+
 
 # directory
 data_dir = 'data/'
