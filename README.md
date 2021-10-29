@@ -13,5 +13,11 @@ Project Organization
 -----------
 
     ├── data                 <- folder holding train and test data    
-    ├── src                  <- folder holding the necessary scripts to preprocess the data and generate the models
+    ├── src                  <- folder holding the necessary scripts to pre-process the data and generate the models
     ├── Starter.ipynb        <- a Jupyter notebook that shows how to run the model and features some basic EDA
+
+Usage
+------
+
+In order to run the notebook, you would need first to download the data from [here](https://www.kaggle.com/c/optiver-realized-volatility-prediction/data).
+I strongly recommend to run the data pre-processing step only once and then save the resulting datasets in parquet format. You will find a cell to save the generated data and another one to load it in the first section of the Jupyter notebook, just remove the comments as needed.
