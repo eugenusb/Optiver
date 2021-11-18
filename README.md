@@ -19,5 +19,5 @@ Project Organization
 Usage
 ------
 
-In order to run the notebook, you would need first to download the data from [here](https://www.kaggle.com/c/optiver-realized-volatility-prediction/data).
-I strongly recommend to run the data pre-processing step only once and then save the resulting datasets in parquet format. You will find a cell to save the generated data and another one to load it in the first section of the Jupyter notebook, just remove the comments as needed.
+In order to run the notebook, you would need first to download the data from [here](https://www.kaggle.com/c/optiver-realized-volatility-prediction/data) and save it to the `data` folder.
+I strongly recommend to run the data pre-processing step only once and saving afterwards the resulting datasets in parquet format. You will find a cell to save the generated data and another one to load it in the first section of the Jupyter notebook, just remove the comments as needed.
